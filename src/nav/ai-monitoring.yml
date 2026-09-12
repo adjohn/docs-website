@@ -11,6 +11,8 @@ pages:
         path: /install/ai-monitoring
       - title: Send GenAI traces with OpenTelemetry
         path: /docs/ai-monitoring/opentelemetry-ai-monitoring
+      - title: Monitor the OpenAI Agents SDK
+        path: /docs/ai-monitoring/monitor-openai-agents-sdk
   - title: Explore your AI data
     pages:
       - title: Analyze model data

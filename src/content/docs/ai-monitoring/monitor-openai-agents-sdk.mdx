@@ -1,0 +1,219 @@
+---
+title: 'Monitor the OpenAI Agents SDK with New Relic'
+metaDescription: 'Send OpenAI Agents SDK traces to New Relic over OTLP so agent workflows, LLM calls, and tool calls appear in AI monitoring with full span detail.'
+freshnessValidatedDate: never
+---
+
+The [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) is OpenAI's Python framework for building agentic applications: agents with instructions, tools, and handoffs, driven by a runner. You can monitor it with New Relic using the OpenTelemetry instrumentation for the SDK and New Relic's native OTLP endpoint. No New Relic agent is required.
+
+Once your application is instrumented, New Relic captures the full execution of each agent run:
+
+* A root span for the agent workflow, with a child span for each agent invocation, each LLM call, and each tool call.
+* Model, token usage, finish reasons, and the input and output messages on every LLM span.
+* Tool call arguments and results on every tool span.
+
+Your service appears as an OpenTelemetry service entity. New Relic also synthesizes AI agent and AI tool entities from the agent and tool spans, so your agents and tools appear in AI monitoring's agent views. See [Monitor AI agents and tools](/docs/ai-monitoring/explore-ai-data/view-ai-agents).
+
+## Before you start [#before-you-start]
+
+You will need:
+
+* A New Relic [ingest license key](/docs/apis/intro-apis/new-relic-api-keys/#ingest-license-key).
+* An OpenAI API key, since your agents call OpenAI models.
+* A Python application built on the OpenAI Agents SDK, or the minimal example below.
+* Network egress from your application to the New Relic OTLP endpoint for your region. See [Send data to New Relic using OpenTelemetry Protocol (OTLP)](/docs/opentelemetry/best-practices/opentelemetry-otlp/).
+
+<Callout variant="important">
+  The instrumentation records the input and output messages of your LLM calls, including their content, and the arguments and results of tool calls. If your prompts can contain PII, credentials, or regulated data, review your data-handling policies before sending this data, and consider [drop filters](/docs/ai-monitoring/drop-sensitive-data) to strip sensitive attributes at ingest.
+</Callout>
+
+<Steps>
+
+<Step>
+
+### Install the packages [#install]
+
+```sh
+pip install openai-agents opentelemetry-instrumentation-openai-agents opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+```
+
+This guide was verified with `opentelemetry-instrumentation-openai-agents` 0.62.3.
+
+</Step>
+
+<Step>
+
+### Configure the exporter and instrument the SDK [#configure]
+
+Create a standard OpenTelemetry `TracerProvider` with an OTLP exporter pointed at New Relic, then activate `OpenAIAgentsInstrumentor` against it. Set this up once, at process startup, before any agent runs:
+
+```python
+import os
+
+from agents import set_trace_processors
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.openai_agents import OpenAIAgentsInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+set_trace_processors([])
+
+provider = TracerProvider(
+    resource=Resource.create({"service.name": "weather-agent"})
+)
+provider.add_span_processor(
+    BatchSpanProcessor(
+        OTLPSpanExporter(
+            endpoint="https://otlp.nr-data.net:4318/v1/traces",
+            headers={"api-key": os.environ["NEW_RELIC_LICENSE_KEY"]},
+        )
+    )
+)
+OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
+```
+
+A few notes on this snippet:
+
+* `set_trace_processors([])` turns off the Agents SDK's built-in trace upload to the OpenAI dashboard, so traces flow only to New Relic. To send traces to both, omit that call.
+* If your account is in the EU data center, use `https://otlp.eu01.nr-data.net:4318/v1/traces` as the endpoint.
+* Instead of constructing the exporter in code, you can configure it with the standard environment variables `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS="api-key=<YOUR_LICENSE_KEY>"`.
+
+</Step>
+
+<Step>
+
+### Run an agent [#run]
+
+If you don't have an agent handy, this minimal example exercises an agent, an LLM call, and a tool call:
+
+```python
+import asyncio
+
+from agents import Agent, Runner, function_tool
+
+
+@function_tool
+def get_weather(city: str) -> str:
+    return f"Sunny, 22C in {city}"
+
+
+agent = Agent(
+    name="WeatherAgent",
+    instructions="Answer using the get_weather tool.",
+    tools=[get_weather],
+)
+
+result = asyncio.run(Runner.run(agent, "What is the weather in Tokyo?"))
+print(result.final_output)
+provider.force_flush()
+```
+
+For a short-lived script like this one, call `provider.force_flush()` (or shut down the provider) before the process exits. The `BatchSpanProcessor` exports on an interval, and a process that exits first drops its unexported spans. Long-running services don't need this.
+
+</Step>
+
+<Step>
+
+### Find your data in New Relic [#verify]
+
+Within a few minutes, query your spans in <DNT>**Query Your Data**</DNT>:
+
+```sql
+SELECT name, gen_ai.operation.name, gen_ai.response.model, gen_ai.usage.total_tokens
+FROM Span
+WHERE service.name = 'weather-agent'
+SINCE 30 minutes ago
+```
+
+Your service appears under <DNT>**All entities > Services - OpenTelemetry**</DNT>, and the agents and tools it runs appear in AI monitoring's agent views. See [Monitor AI agents and tools](/docs/ai-monitoring/explore-ai-data/view-ai-agents).
+
+</Step>
+
+</Steps>
+
+## What the spans contain [#span-reference]
+
+Each agent run produces a trace shaped like the run itself:
+
+<table>
+  <thead>
+    <tr>
+      <th>
+        Span name
+      </th>
+
+      <th>
+        `gen_ai.operation.name`
+      </th>
+
+      <th>
+        What it carries
+      </th>
+    </tr>
+  </thead>
+
+  <tbody>
+    <tr>
+      <td>
+        `Agent Workflow`
+      </td>
+
+      <td>
+        (none)
+      </td>
+
+      <td>
+        The root span for one `Runner.run` invocation.
+      </td>
+    </tr>
+
+    <tr>
+      <td>
+        `<AgentName>.agent`
+      </td>
+
+      <td>
+        `invoke_agent`
+      </td>
+
+      <td>
+        One span per agent invocation, with `gen_ai.agent.name`.
+      </td>
+    </tr>
+
+    <tr>
+      <td>
+        `openai.response`
+      </td>
+
+      <td>
+        `chat`
+      </td>
+
+      <td>
+        One span per LLM call: `gen_ai.provider.name`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons`, token usage (`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.total_tokens`, plus cache-read and reasoning token counts), and the full `gen_ai.input.messages` and `gen_ai.output.messages` with content.
+      </td>
+    </tr>
+
+    <tr>
+      <td>
+        `<tool>.tool`
+      </td>
+
+      <td>
+        `execute_tool`
+      </td>
+
+      <td>
+        One span per tool call: `gen_ai.tool.name`, `gen_ai.tool.type`, `gen_ai.tool.call.arguments`, and `gen_ai.tool.call.result`.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+The attribute names follow the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/).
+
+<Callout variant="tip">
+  The instrumentation extracts richer usage detail from the SDK's default Responses API model path than from its Chat Completions model path. If your agents use a Chat Completions model class, expect thinner token usage attributes on the LLM spans, such as missing cache-read and reasoning token counts.
+</Callout>
